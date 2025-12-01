@@ -4,7 +4,7 @@ from typing import Union, List, Literal
 
 import numpy as np
 import torch
-
+import os
 
 class UndefinedMetricWarning(UserWarning):
     pass
@@ -48,10 +48,91 @@ def _warn_prf(average: str, modifier: str, msg_start: str, result_size: int):
     msg += " Use `zero_division` parameter to control this behavior."
     warnings.warn(msg, UndefinedMetricWarning, stacklevel=3)
 
+# def calculate_iou(start1, end1, start2, end2):
+#     """
+#     Calculate the Intersection over Union (IoU) between two entities.
+#     """
+#     if start1 == end1:
+#         if start1 == start2:
+#             if end1 == end2:
+#                 return 1
+#             else:
+#                 return 1 / abs(end1 - end2)
+#         else: # 
+#             return 0
+#     # Calculate intersection
+#     intersection_start = max(start1, start2)
+#     intersection_end = min(end1, end2)
+#     intersection_len = max(0, intersection_end - intersection_start)
+   
 
-def extract_tp_actual_correct(y_true, y_pred):
+#     # Calculate union
+#     # calculate union by token level
+#     union_len = max(end1, end2) - min(start1, start2) 
+
+#     # Compute IoU
+#     return intersection_len / union_len if union_len > 0 else 0
+
+def span_iou(span1, span2):
+    if span1 == span2:
+      return 1
+    s1_start, s1_end = span1
+    s2_start, s2_end = span2
+
+    # Normalize ordering
+    if s1_start > s1_end:
+        s1_start, s1_end = s1_end, s1_start
+    if s2_start > s2_end:
+        s2_start, s2_end = s2_end, s2_start
+
+    # Check zero-length original spans
+    zero1 = (s1_start == s1_end)
+    zero2 = (s2_start == s2_end)
+
+    # Convert zero-length spans to length 1
+    if zero1:
+        point1 = s1_start
+        s1_end = s1_start + 1
+
+    if zero2:
+        point2 = s2_start
+        s2_end = s2_start + 1
+
+    # Compute intersection using standard interval logic
+    inter_start = max(s1_start, s2_start)
+    inter_end = min(s1_end, s2_end)
+    intersection = max(0, inter_end - inter_start)
+
+    # SPECIAL INTERSECTION RULE
+    if zero1 and intersection == 0:
+        # does other span end exactly at point?
+        if s2_start <= point1 <= s2_end:
+            intersection = 1
+
+    if zero2 and intersection == 0:
+        if s1_start <= point2 <= s1_end:
+            intersection = 1
+
+    # Lengths
+    len1 = s1_end - s1_start
+    len2 = s2_end - s2_start
+
+    # SPECIAL UNION RULE if any point span is involved
+    if zero1 or zero2:
+        union = len1 + len2
+    else:
+        union = len1 + len2 - intersection
+
+    return intersection / union if union > 0 else 0.0
+
+
+
+
+def extract_tp_actual_correct(y_true, y_pred, iou_threshold=0.8):
     entities_true = defaultdict(set)
     entities_pred = defaultdict(set)
+
+
 
     for type_name, (start, end), idx in y_true:
         entities_true[type_name].add((start, end, idx))
@@ -63,12 +144,72 @@ def extract_tp_actual_correct(y_true, y_pred):
     tp_sum = np.array([], dtype=np.int32)
     pred_sum = np.array([], dtype=np.int32)
     true_sum = np.array([], dtype=np.int32)
-    for type_name in target_names:
-        entities_true_type = entities_true.get(type_name, set())
-        entities_pred_type = entities_pred.get(type_name, set())
-        tp_sum = np.append(tp_sum, len(entities_true_type & entities_pred_type))
-        pred_sum = np.append(pred_sum, len(entities_pred_type))
-        true_sum = np.append(true_sum, len(entities_true_type))
+    # print(f"entities_true: {entities_true}")
+    # print(f"entities_pred: {entities_pred}")
+    # USE_EXACT_MATCHING = bool(os.getenv("USE_EXACT_MATCHING", True))
+    USE_EXACT_MATCHING = int(os.getenv("USE_EXACT_MATCHING", 0))
+    if USE_EXACT_MATCHING:
+        print("Using exact matching")
+        for type_name in target_names:
+            entities_true_type = entities_true.get(type_name, set())
+            entities_pred_type = entities_pred.get(type_name, set())
+            
+            # print(f"type_name: {type_name}")
+
+            
+            tp_sum = np.append(tp_sum, len(entities_true_type & entities_pred_type))
+            pred_sum = np.append(pred_sum, len(entities_pred_type))
+            true_sum = np.append(true_sum, len(entities_true_type))
+
+            # print(f"tp_sum: {tp_sum}, pred_sum: {pred_sum}, true_sum: {true_sum}")
+            # print("--------------------------------")
+    else:
+        print("Using IoU matching")
+
+        iou_threshold = float(os.getenv("IOU_THRESHOLD", 0.8))
+        print(f"EVALUATOR iou_threshold: {iou_threshold}")
+        
+        for type_name in target_names:
+            entities_true_type = entities_true.get(type_name, set())
+            entities_pred_type = entities_pred.get(type_name, set())
+
+            # Calculate true positives (TP) with one-to-one matching
+            # Track which predicted entities have been matched to avoid double-counting
+            matched_pred_entities = set()
+            tp = 0
+            
+            for true_entity in entities_true_type:
+                true_start, true_end, _ = true_entity
+                # best_iou = 0
+                best_pred_entity = None
+                
+                # Find the best matching predicted entity that hasn't been matched yet
+                for pred_entity in entities_pred_type:
+                    if pred_entity in matched_pred_entities:
+                        continue  # Skip already matched entities
+                        
+                    pred_start, pred_end, _ = pred_entity
+                    
+                    iou = span_iou((true_start, true_end), (pred_start, pred_end))
+                    # if iou >= iou_threshold and iou > best_iou:
+                    #     best_iou = iou
+                    #     best_pred_entity = pred_entity
+
+                    if iou >= iou_threshold:
+                        # if iou > best_iou:
+                        #     best_iou = iou
+                        best_pred_entity = pred_entity
+                
+                # If we found a match, count it and mark the predicted entity as used
+                if best_pred_entity is not None:
+                    tp += 1
+                    matched_pred_entities.add(best_pred_entity)
+
+            # Calculating the total predictions and true entities
+            pred_sum = np.append(pred_sum, len(entities_pred_type))
+            true_sum = np.append(true_sum, len(entities_true_type))
+            tp_sum = np.append(tp_sum, tp)
+
 
     return pred_sum, tp_sum, true_sum, target_names
 
@@ -103,7 +244,7 @@ def compute_prf(y_true, y_pred, average="micro"):
         warn_for=["precision", "recall", "f-score"],
         zero_division="warn",
     )
-
+    # print(f"tp_sum: {tp_sum}, pred_sum: {pred_sum}, true_sum: {true_sum}")
     recall = _prf_divide(
         numerator=tp_sum,
         denominator=true_sum,
